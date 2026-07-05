@@ -59,7 +59,7 @@ export function usePaymentEvents() {
         .filter((e): e is PaymentEvent => e !== null)
         .sort((a, b) => b.timestamp - a.timestamp);
     },
-    refetchInterval: 8_000,
+    refetchInterval: 1_000,
   });
 }
 

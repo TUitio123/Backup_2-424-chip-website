@@ -55,7 +55,7 @@ export function useInvalidateRequests() {
         .filter((e): e is InvalidateRequestEvent => e !== null)
         .sort((a, b) => b.timestamp - a.timestamp);
     },
-    refetchInterval: 8_000,
+    refetchInterval: 1_000,
   });
 }
 

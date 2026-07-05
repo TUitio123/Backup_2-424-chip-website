@@ -45,6 +45,6 @@ export function useVerifyLogs() {
         .filter((e): e is VerifyLogEvent => e !== null)
         .sort((a, b) => b.timestamp - a.timestamp);
     },
-    refetchInterval: 10_000,
+    refetchInterval: 1_000,
   });
 }

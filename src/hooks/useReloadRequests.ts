@@ -48,7 +48,7 @@ export function useReloadRequests() {
         .filter((e): e is ReloadRequestEvent => e !== null)
         .sort((a, b) => b.timestamp - a.timestamp);
     },
-    refetchInterval: 15_000,
+    refetchInterval: 1_000,
   });
 }
 
