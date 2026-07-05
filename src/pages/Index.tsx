@@ -61,10 +61,12 @@ function formatTs(unix: number) {
 
 function reloadAmount(chip: ChipEntry) { return chip.sats + calcReloadFee(chip.sats); }
 
-/** LNbits API URL — routed via CORS proxy */
+/** LNbits API URL — direkt, Proxy nur als Fallback */
 function lnbitsUrl(path: string): string {
-  const direct = `${LNBITS_CONFIG.nodeUrl}${path}`;
-  return `${CORS_PROXY}${encodeURIComponent(direct)}`;
+  return `${LNBITS_CONFIG.nodeUrl}${path}`;
+}
+function lnbitsUrlProxy(path: string): string {
+  return `${CORS_PROXY}${encodeURIComponent(`${LNBITS_CONFIG.nodeUrl}${path}`)}`;
 }
 
 function formatTimeLeft(s: number) {
@@ -250,47 +252,43 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
       const isBolt11 = invoice.toLowerCase().startsWith('lnbc');
 
       if (!isBolt11) {
-        setLog(`Lightning-Adresse erkannt: ${invoice}\n`);
-        setErrMsg(
-          `Lightning-Adresse erkannt (${invoice}). Bitte sende eine BOLT11-Invoice (lnbc...) aus deiner Wallet.`
-        );
+        setErrMsg('Bitte BOLT11-Invoice (lnbc...) senden, keine Lightning-Adresse.');
         setPhase('error');
         return;
       }
 
-      const logMsg = `POST ${LNBITS_CONFIG.nodeUrl}/api/v1/payments (via CORS-Proxy)\n` +
-        `out: true, bolt11: ${invoice.slice(0, 40)}...\n`;
-      setLog(logMsg);
+      // Direkt an LNbits — schnellster Weg
+      setLog(`POST ${LNBITS_CONFIG.nodeUrl}/api/v1/payments\nout: true, bolt11: ${invoice.slice(0, 40)}...\n`);
 
-      const res = await fetch(lnbitsUrl('/api/v1/payments'), {
-        method: 'POST',
-        headers: {
-          'X-Api-Key': LNBITS_CONFIG.adminKey,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          out: true,
-          bolt11: invoice,
-        }),
-      });
+      let res: Response;
+      let data: Record<string, unknown>;
+      try {
+        res = await fetch(lnbitsUrl('/api/v1/payments'), {
+          method: 'POST',
+          headers: { 'X-Api-Key': LNBITS_CONFIG.adminKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ out: true, bolt11: invoice }),
+        });
+        data = await res.json() as Record<string, unknown>;
+      } catch {
+        // CORS? Fallback via Proxy
+        setLog(prev => prev + 'Direkt fehlgeschlagen, versuche Proxy...\n');
+        res = await fetch(lnbitsUrlProxy('/api/v1/payments'), {
+          method: 'POST',
+          headers: { 'X-Api-Key': LNBITS_CONFIG.adminKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ out: true, bolt11: invoice }),
+        });
+        data = await res.json() as Record<string, unknown>;
+      }
 
-      const data = await res.json() as Record<string, unknown>;
-      const responseLog = `Response ${res.status}: ${JSON.stringify(data)}\n`;
-      setLog(prev => prev + responseLog);
+      setLog(prev => prev + `Response ${res.status}: ${JSON.stringify(data)}\n`);
 
       const detail = String(data?.detail ?? data?.message ?? '');
       const alreadyPaid = !res.ok && detail.toLowerCase().includes('already paid');
 
       if (!res.ok && !alreadyPaid) {
-        let userMsg = `Zahlung fehlgeschlagen: ${detail || `HTTP ${res.status}`}`;
-        if (res.status === 401 || res.status === 403) {
-          userMsg = 'API-Key ungueltig oder keine Berechtigung.';
-        } else if (detail.toLowerCase().includes('insufficient')) {
-          userMsg = 'Ungenuegend Guthaben auf dem LNbits-Wallet.';
-        } else if (detail.toLowerCase().includes('expired')) {
-          userMsg = 'Invoice abgelaufen. Bitte neue Invoice von der App anfordern.';
-        }
-        setErrMsg(userMsg);
+        setErrMsg(detail.includes('insufficient') ? 'Kein Guthaben auf LNbits-Wallet.' :
+                  detail.includes('expired') ? 'Invoice abgelaufen.' :
+                  `Zahlung fehlgeschlagen: ${detail || `HTTP ${res.status}`}`);
         setPhase('error');
         return;
       }
@@ -298,25 +296,18 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
       const hash = String(data.payment_hash ?? data.checking_id ?? '');
       setTxHash(hash);
 
-      // Kind-3493 type:"payout" → permanent invalid bis naechstes Aufladen
+      // Kind-3493 type:"payout" → App + Website sehen: ausgezahlt
       await pub({
         kind: KIND_PAYMENT_CONFIRMED,
-        content: JSON.stringify({
-          uid: chip.uid,
-          paymentHash: hash,
-          sats,
-          type: 'payout',
-          paidAt: new Date().toISOString(),
-        }),
+        content: JSON.stringify({ uid: chip.uid, paymentHash: hash, sats, type: 'payout', paidAt: new Date().toISOString() }),
         tags: [['t', APP_TAG], ['alt', 'Bitcoin Note payout confirmed']],
       });
 
-      setLog(prev => prev + 'Kind-3493 type:payout publiziert → permanent invalid\n');
       setPhase('done');
       onPayoutDone();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setLog(prev => prev + `EXCEPTION: ${msg}\n`);
+      setLog(prev => prev + `FEHLER: ${msg}\n`);
       setErrMsg(msg);
       setPhase('error');
     }
@@ -634,6 +625,34 @@ function ChipDetailPage({
         </div>
       </div>
 
+      {/* Status-Bestaetigung: AUFGELADEN */}
+      {resolvedStatus === 'valid' && paidAt && (
+        <div className="rounded-2xl p-4 flex items-center gap-3"
+          style={{ background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.2)' }}>
+          <CheckCircle2 className="w-6 h-6 flex-shrink-0" style={{ color: '#34d399' }} />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-bold" style={{ color: '#34d399' }}>Aufgeladen — Chip darf auf &quot;valid&quot; gesetzt werden</p>
+            <p className="text-[10px] mt-0.5" style={{ color: 'rgba(255,255,255,0.3)' }}>
+              Zahlung bestaetigt. App kann den Chip direkt auf valid schreiben.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Status-Bestaetigung: AUSGEZAHLT */}
+      {resolvedStatus === 'invalid' && (
+        <div className="rounded-2xl p-4 flex items-center gap-3"
+          style={{ background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)' }}>
+          <ShieldX className="w-6 h-6 flex-shrink-0" style={{ color: '#f87171' }} />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-bold" style={{ color: '#f87171' }}>Ausgezahlt — Chip ist entwertet</p>
+            <p className="text-[10px] mt-0.5" style={{ color: 'rgba(255,255,255,0.3)' }}>
+              Auszahlung bestaetigt. Chip bleibt invalid bis er erneut aufgeladen wird.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Entwerten Panel — wenn Anfrage vorhanden und NOCH NICHT ausgezahlt */}
       {invalidateRequest && resolvedStatus !== 'invalid' && (
         <EntwertPanel
@@ -646,20 +665,22 @@ function ChipDetailPage({
       )}
 
       {/* Aufladen */}
-      <div className="rounded-2xl p-4 space-y-3"
-        style={{ background: 'rgba(247,147,26,0.02)', border: '1px solid rgba(247,147,26,0.08)' }}>
-        <div className="flex items-center gap-2 mb-1">
-          <Zap className="w-4 h-4" style={{ color: '#f7931a' }} />
-          <span className="text-sm font-black" style={{ color: 'rgba(255,255,255,0.8)' }}>Aufladen</span>
+      {resolvedStatus !== 'valid' && (
+        <div className="rounded-2xl p-4 space-y-3"
+          style={{ background: 'rgba(247,147,26,0.02)', border: '1px solid rgba(247,147,26,0.08)' }}>
+          <div className="flex items-center gap-2 mb-1">
+            <Zap className="w-4 h-4" style={{ color: '#f7931a' }} />
+            <span className="text-sm font-black" style={{ color: 'rgba(255,255,255,0.8)' }}>Aufladen</span>
+          </div>
+          <InvoiceCell
+            chip={chip} paidAt={paidAt}
+            hasReloadRequest={hasReloadRequest} requestedAt={requestedAt}
+            onPaid={onPaid} onUnload={onUnload}
+            sessionRequested={sessionRequested}
+            compact
+          />
         </div>
-        <InvoiceCell
-          chip={chip} paidAt={paidAt}
-          hasReloadRequest={hasReloadRequest} requestedAt={requestedAt}
-          onPaid={onPaid} onUnload={onUnload}
-          sessionRequested={sessionRequested}
-          compact
-        />
-      </div>
+      )}
 
       {/* Verify Log */}
       <div className="space-y-2">
