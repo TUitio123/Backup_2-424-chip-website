@@ -899,9 +899,14 @@ export default function Index() {
               onBack={() => { setSelectedUID(null); navigate('/'); }}
               onPayoutDone={() => markPayoutDone()}
               verifyLogs={verifyLogs}
-              invalidateRequest={selectedInvalidateReq && rStatus !== 'invalid'
-                ? { invoice: selectedInvalidateReq.invoice, sats: selectedInvalidateReq.sats, requestedAt: selectedInvalidateReq.timestamp }
-                : null}
+              invalidateRequest={(() => {
+                // Nur anzeigen wenn: Anfrage existiert, Status nicht schon invalid,
+                // UND Anfrage ist NEUER als die letzte Aufladung
+                if (!selectedInvalidateReq || rStatus === 'invalid') return null;
+                const lastReload = latestPaymentForChip(paymentEvents, selectedUID);
+                if (lastReload && lastReload.type === 'reload' && selectedInvalidateReq.timestamp <= lastReload.timestamp) return null;
+                return { invoice: selectedInvalidateReq.invoice, sats: selectedInvalidateReq.sats, requestedAt: selectedInvalidateReq.timestamp };
+              })()}
             />
           );
         })()}
@@ -1026,16 +1031,23 @@ export default function Index() {
               </div>
             )}
 
-            {/* Pending Entwertungen */}
-            {invalidateRequests.filter(r => r.chipStatus === 'invalid' && !isChipPaidOut(paymentEvents, r.uid)).length > 0 && (
+            {/* Pending Entwertungen — nur NEUE Anfragen (nicht aelter als letzter reload/payout) */}
+            {(() => {
+              const pending = invalidateRequests.filter(r => {
+                if (r.chipStatus !== 'invalid') return false;
+                const latest = latestPaymentForChip(paymentEvents, r.uid);
+                if (!latest) return true; // kein Payment-Event → Anfrage gilt
+                // Anfrage muss NEUER sein als das letzte Payment-Event
+                return r.timestamp > latest.timestamp;
+              });
+              return pending.length > 0 && (
               <div className="space-y-2">
                 <h3 className="text-xs font-bold uppercase tracking-wider flex items-center gap-2"
                   style={{ color: '#f87171' }}>
                   <AlertTriangle className="w-3.5 h-3.5" />
-                  Offene Entwertungen ({invalidateRequests.filter(r => r.chipStatus === 'invalid' && !isChipPaidOut(paymentEvents, r.uid)).length})
+                  Offene Entwertungen ({pending.length})
                 </h3>
-                {invalidateRequests
-                  .filter(r => r.chipStatus === 'invalid' && !isChipPaidOut(paymentEvents, r.uid))
+                {pending
                   .slice(0, 5)
                   .map(req => {
                     const chip = CHIP_REGISTRY.find(c => normalizeUID(c.uid) === normalizeUID(req.uid));
@@ -1071,7 +1083,8 @@ export default function Index() {
                     );
                   })}
               </div>
-            )}
+              );
+            })()}
 
             {/* All chips */}
             <div className="space-y-2">
@@ -1103,7 +1116,7 @@ export default function Index() {
                     </div>
                     <div className="font-mono text-[10px] break-all" style={{ color: 'rgba(255,255,255,0.25)' }}>{chip.uid}</div>
                     <div className="pt-1 border-t" style={{ borderColor: 'rgba(255,255,255,0.04)' }}>
-                      {invReq && rStatus !== 'invalid' ? (
+                      {invReq && rStatus !== 'invalid' && rStatus !== 'valid' ? (
                         <button onClick={() => setSelectedUID(chip.uid)}
                           className="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1.5 rounded-xl font-bold"
                           style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', color: '#f87171' }}>
