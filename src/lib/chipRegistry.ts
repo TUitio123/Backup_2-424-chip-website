@@ -10,7 +10,7 @@ export interface ChipEntry {
 }
 
 export const CHIP_REGISTRY: ChipEntry[] = [
-  { uid: '0494695ABF1D90', label: '1.500 sats', sats: 1500, status: 'invalid', issuedAt: '05.07.2026' },
+  { uid: '04A3695ABF1D90', label: '1.500 sats', sats: 1500, status: 'invalid', issuedAt: '05.07.2026' },
   { uid: '0494695ABF1D90', label: '1.400 sats', sats: 1400, status: 'invalid', issuedAt: '05.07.2026' },
   { uid: '0492695ABF1D90', label: '1.300 sats', sats: 1300, status: 'invalid', issuedAt: '05.07.2026' },
   { uid: '04A4695ABF1D90', label: '1.200 sats', sats: 1200, status: 'invalid', issuedAt: '05.07.2026' },
