@@ -10,17 +10,11 @@ export interface ChipEntry {
 }
 
 export const CHIP_REGISTRY: ChipEntry[] = [
-  { uid: '04C1685ABF1D90', label: '1.100 sats', sats: 1100, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '04AC695ABF1D90', label: '1.150 sats', sats: 1150, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '04C6695ABF1D90', label: '1.200 sats', sats: 1200, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '04BD695ABF1D90', label: '1.250 sats', sats: 1250, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '04AE695ABF1D90', label: '1.300 sats', sats: 1300, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '04AD695ABF1D90', label: '1.350 sats', sats: 1350, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '04BC695ABF1D90', label: '1.400 sats', sats: 1400, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '0493695ABF1D90', label: '1.500 sats', sats: 1500, status: 'valid',   issuedAt: '04.07.2026' },
-  { uid: '0492695ABF1D90', label: '1.100 sats', sats: 1100, status: 'valid',   issuedAt: '05.07.2026' },
-  { uid: '04A4695ABF1D90', label: '2.100 sats', sats: 2100, status: 'valid',   issuedAt: '05.07.2026' },
-  { uid: '0495695ABF1D90', label: '3.100 sats', sats: 3100, status: 'valid',   issuedAt: '05.07.2026' },
+  { uid: '0494695ABF1D90', label: '1.500 sats', sats: 1500, status: 'invalid', issuedAt: '05.07.2026' },
+  { uid: '0494695ABF1D90', label: '1.400 sats', sats: 1400, status: 'invalid', issuedAt: '05.07.2026' },
+  { uid: '0492695ABF1D90', label: '1.300 sats', sats: 1300, status: 'invalid', issuedAt: '05.07.2026' },
+  { uid: '04A4695ABF1D90', label: '1.200 sats', sats: 1200, status: 'invalid', issuedAt: '05.07.2026' },
+  { uid: '0495695ABF1D90', label: '1.100 sats', sats: 1100, status: 'invalid', issuedAt: '05.07.2026' },
 ];
 
 export function normalizeUID(uid: string): string {
