@@ -1,19 +1,18 @@
 /**
- * Index.tsx — Bitcoin Note Verifier Website
+ * Index.tsx — Bitcoin Note Verifier Website (Backup_2 - Fixed)
  *
- * Features:
- * - Chip-Übersicht: alle registrierten Bitcoin-Scheine
- * - Status kommt dynamisch aus Nostr-Events (nicht hardcoded)
- * - Aufladen via Lightning/LNbits
- * - Entwerten-Flow:
- *     1. App schreibt "invalid" auf Chip, sendet Kind-3492 mit Invoice
- *     2. Website empfängt Kind-3492, prüft chipStatus === "invalid"
- *     3. Website prüft Betrag: invoice sats == chip.sats
- *     4. Website zahlt aus via LNbits Admin-Key (POST /api/v1/payments out: true)
- *     5. Website sendet Kind-3493 (Bestätigung) + persistiert dauerhaft in localStorage
- *     6. Erst nach erneutem Aufladen kann Chip wieder auf valid gesetzt werden
- * - Chip-Detail: aufrufen per ?chip=UID oder Klick in Liste
- * - Verifikations-Log
+ * STATUS-LOGIK (Single Source of Truth = Nostr Kind-3493 Events):
+ *   - Kind-3493 type:"reload" → aufgeladen → valid (bis naechste Entwertung)
+ *   - Kind-3493 type:"payout" → ausgezahlt → invalid (bis naechstes Aufladen)
+ *   - Neuestes Event pro UID gewinnt
+ *   - Kein doppeltes Aufladen/Entwerten moeglich
+ *
+ * AUSZAHLUNGS-FLOW:
+ *   1. App schreibt "invalid" auf Chip, sendet Kind-3492 mit BOLT11-Invoice
+ *   2. Website empfaengt Kind-3492, zeigt Entwertungs-Panel
+ *   3. Website zahlt AUTOMATISCH aus via LNbits (CORS-Proxy)
+ *   4. Website sendet Kind-3493 type:"payout" → permanent invalid
+ *   5. Erst nach neuem Aufladen (Kind-3493 type:"reload") wieder valid
  */
 
 import { useSeoMeta } from '@unhead/react';
@@ -25,7 +24,7 @@ import {
   ChevronDown, ArrowLeft, Database,
   ShieldX, LayoutGrid, Terminal, Eye, EyeOff,
   Send, AlertCircle,
-  LogIn, LogOut, Trash2, Edit, Lock,
+  LogIn, LogOut, Edit, Lock,
 } from 'lucide-react';
 import {
   CHIP_REGISTRY, type ChipEntry, type ChipStatus,
@@ -35,6 +34,7 @@ import {
 import { useVerifyLogs } from '@/hooks/useVerifyLogs';
 import { useReloadRequests, latestReloadRequest } from '@/hooks/useReloadRequests';
 import { useInvalidateRequests, latestInvalidateRequest } from '@/hooks/useInvalidateRequests';
+import { usePaymentEvents, latestPaymentForChip } from '@/hooks/usePaymentEvents';
 import { usePublishAnonymous } from '@/hooks/usePublishAnonymous';
 import { QRCodeCanvas } from '@/components/ui/qrcode';
 import { LNBITS_CONFIG, calcReloadFee } from '@/lib/lnbitsConfig';
@@ -45,8 +45,6 @@ const ADMIN_PASS = '1234567890';
 const ADMIN_STORAGE_KEY = 'bitcoin-note-admin-auth';
 
 const DOWNLOAD_URL      = '/app-debug.apk';
-const PAID_STORAGE_KEY  = 'bitcoin-note-paid-chips';
-const PAYOUT_DONE_KEY   = 'bitcoin-note-payout-done'; // UIDs die ausgezahlt wurden (persistent)
 const SESSION_RELOAD_KEY = 'bitcoin-note-session-reloads';
 
 /** CORS proxy — demo.lnbits.com blocks cross-origin POST */
@@ -91,28 +89,8 @@ function getInitialUID(): string | null {
   } catch { return null; }
 }
 
-// ─── LocalStorage helpers ─────────────────────────────────────────────────────
+// ─── Session helpers ──────────────────────────────────────────────────────────
 
-function loadPaidChips(): Record<string, string> {
-  try { return JSON.parse(localStorage.getItem(PAID_STORAGE_KEY) ?? '{}') as Record<string, string>; }
-  catch { return {}; }
-}
-function savePaidChip(uid: string, at: string) {
-  const c = loadPaidChips(); c[uid] = at;
-  localStorage.setItem(PAID_STORAGE_KEY, JSON.stringify(c));
-}
-function clearPaidChip(uid: string) {
-  const c = loadPaidChips(); delete c[uid];
-  localStorage.setItem(PAID_STORAGE_KEY, JSON.stringify(c));
-}
-function loadPayoutDone(): Set<string> {
-  try { return new Set(JSON.parse(localStorage.getItem(PAYOUT_DONE_KEY) ?? '[]') as string[]); }
-  catch { return new Set<string>(); }
-}
-function savePayoutDone(uid: string) {
-  const s = loadPayoutDone(); s.add(normalizeUID(uid));
-  localStorage.setItem(PAYOUT_DONE_KEY, JSON.stringify([...s]));
-}
 function loadSessionReloads(): Set<string> {
   try { return new Set(JSON.parse(sessionStorage.getItem(SESSION_RELOAD_KEY) ?? '[]') as string[]); }
   catch { return new Set<string>(); }
@@ -122,34 +100,50 @@ function saveSessionReload(uid: string) {
   sessionStorage.setItem(SESSION_RELOAD_KEY, JSON.stringify([...c]));
 }
 
-// ─── Resolve chip status ──────────────────────────────────────────────────────
+// ─── Resolve chip status (Single Source of Truth: Nostr Kind-3493) ────────────
+
+import type { PaymentEvent } from '@/hooks/usePaymentEvents';
+import type { InvalidateRequestEvent } from '@/hooks/useInvalidateRequests';
 
 /**
- * Dynamische Status-Aufloesung:
- * 1. Wenn aufgeladen (paidChips) → "valid" (auch nach Auszahlung, denn erneut bezahlt)
- * 2. Wenn ausgezahlt (payoutDone) UND nicht erneut aufgeladen → "invalid"
- * 3. Wenn Entwertungs-Anfrage laeuft → "entwertenbeantragt"
- * 4. Wenn Chip im Verify-Log als "verified" auftaucht → Status vom letzten Scan
- * 5. Fallback: Status aus Registry (default "valid" fuer neue Chips)
+ * Status-Logik (Nostr-basiert, persistent):
  *
- * Logik: Der Status kommt primaer vom Chip selbst (App schreibt auf NFC).
- * Die Website bildet den Status nur aus den Nostr-Events ab.
+ * 1. Neuestes Kind-3493 type:"reload" → "valid" (aufgeladen)
+ * 2. Neuestes Kind-3493 type:"payout" → "invalid" (ausgezahlt, permanent)
+ * 3. Kind-3492 vorhanden + noch nicht ausgezahlt → "entwertenbeantragt"
+ * 4. Fallback: Registry-Default "valid" (neuer Chip)
+ *
+ * Die NEUESTE Bestaetigung gewinnt → kein doppeltes Aufladen/Entwerten.
  */
 function resolveChipStatus(
   chip: ChipEntry,
-  payoutDone: Set<string>,
-  paidChips: Record<string, string>,
-  hasInvalidateRequest: boolean,
+  paymentEvents: PaymentEvent[],
+  invalidateRequests: InvalidateRequestEvent[],
 ): ChipStatus {
-  const uid = normalizeUID(chip.uid);
-  // Erneut aufgeladen → immer valid (auch nach vorheriger Auszahlung)
-  if (paidChips[chip.uid]) return 'valid';
-  // Ausgezahlt + nicht erneut aufgeladen → dauerhaft invalid
-  if (payoutDone.has(uid)) return 'invalid';
-  // Entwertungs-Anfrage laeuft → beantragt
-  if (hasInvalidateRequest) return 'entwertenbeantragt';
-  // Fallback: Registry-Default
+  const latest = latestPaymentForChip(paymentEvents, chip.uid);
+
+  if (latest) {
+    if (latest.type === 'reload') return 'valid';
+    if (latest.type === 'payout') return 'invalid';
+  }
+
+  // Kein Kind-3493 vorhanden — pruefen ob Entwertungs-Anfrage laeuft
+  const invReq = latestInvalidateRequest(invalidateRequests, chip.uid);
+  if (invReq) return 'entwertenbeantragt';
+
   return chip.status;
+}
+
+/** Pruefen ob der Chip gerade als "aufgeladen" gilt (fuer Anzeige) */
+function isChipReloaded(paymentEvents: PaymentEvent[], uid: string): boolean {
+  const latest = latestPaymentForChip(paymentEvents, uid);
+  return latest?.type === 'reload';
+}
+
+/** Pruefen ob der Chip bereits ausgezahlt wurde (Doppel-Schutz) */
+function isChipPaidOut(paymentEvents: PaymentEvent[], uid: string): boolean {
+  const latest = latestPaymentForChip(paymentEvents, uid);
+  return latest?.type === 'payout';
 }
 
 // ─── Badges ──────────────────────────────────────────────────────────────────
@@ -246,10 +240,12 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
   const [showLog,  setShowLog]  = useState(false);
   const [log,      setLog]      = useState('');
   const { mutateAsync: pub } = usePublishAnonymous();
+  const autoPayStarted = useRef(false);
 
   const doPayout = useCallback(async () => {
     setPhase('paying');
     setLog('');
+    setErrMsg('');
     try {
       const isBolt11 = invoice.toLowerCase().startsWith('lnbc');
 
@@ -261,12 +257,6 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
         setPhase('error');
         return;
       }
-
-      // BUGFIX Backup_2: BOLT11-Betragsvalidierung entfernt.
-      // Die alte decodeBolt11Amount() hat bei bestimmten Invoice-Formaten
-      // den Betrag falsch dekodiert (z.B. Tausender-Punkt "1.100" vs 1100),
-      // was die Auszahlung blockiert hat.
-      // Der Betrag kommt zuverlässig aus dem Nostr Kind-3492 Event (sats-Feld).
 
       const logMsg = `POST ${LNBITS_CONFIG.nodeUrl}/api/v1/payments (via CORS-Proxy)\n` +
         `out: true, bolt11: ${invoice.slice(0, 40)}...\n`;
@@ -288,17 +278,16 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
       const responseLog = `Response ${res.status}: ${JSON.stringify(data)}\n`;
       setLog(prev => prev + responseLog);
 
-      // "already paid" = Erfolg! Die Invoice wurde schon bezahlt.
       const detail = String(data?.detail ?? data?.message ?? '');
       const alreadyPaid = !res.ok && detail.toLowerCase().includes('already paid');
 
       if (!res.ok && !alreadyPaid) {
         let userMsg = `Zahlung fehlgeschlagen: ${detail || `HTTP ${res.status}`}`;
         if (res.status === 401 || res.status === 403) {
-          userMsg = 'API-Key ungueltig oder keine Berechtigung. Pruefe den Admin-Key in lnbitsConfig.ts';
-        } else if (res.status === 400 && detail.toLowerCase().includes('insufficient')) {
-          userMsg = 'Ungenuegend Guthaben auf dem LNbits-Wallet. Bitte Wallet aufladen.';
-        } else if (res.status === 400 && detail.toLowerCase().includes('expired')) {
+          userMsg = 'API-Key ungueltig oder keine Berechtigung.';
+        } else if (detail.toLowerCase().includes('insufficient')) {
+          userMsg = 'Ungenuegend Guthaben auf dem LNbits-Wallet.';
+        } else if (detail.toLowerCase().includes('expired')) {
           userMsg = 'Invoice abgelaufen. Bitte neue Invoice von der App anfordern.';
         }
         setErrMsg(userMsg);
@@ -309,7 +298,7 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
       const hash = String(data.payment_hash ?? data.checking_id ?? '');
       setTxHash(hash);
 
-      // Publish Kind-3493 payout confirmation — auch wenn "already paid"
+      // Kind-3493 type:"payout" → permanent invalid bis naechstes Aufladen
       await pub({
         kind: KIND_PAYMENT_CONFIRMED,
         content: JSON.stringify({
@@ -322,6 +311,7 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
         tags: [['t', APP_TAG], ['alt', 'Bitcoin Note payout confirmed']],
       });
 
+      setLog(prev => prev + 'Kind-3493 type:payout publiziert → permanent invalid\n');
       setPhase('done');
       onPayoutDone();
     } catch (e) {
@@ -332,8 +322,13 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
     }
   }, [chip.uid, invoice, sats, pub, onPayoutDone]);
 
-  // BUGFIX Backup_2: Kein Auto-Payout mehr — manueller Button stattdessen.
-  // Auto-Payout verursachte Race Conditions und machte Debugging unmoeglich.
+  // AUTOMATISCHE Auszahlung: sobald Panel erscheint, direkt zahlen
+  useEffect(() => {
+    if (phase === 'pending' && !autoPayStarted.current) {
+      autoPayStarted.current = true;
+      void doPayout();
+    }
+  }, [phase, doPayout]);
 
   return (
     <div className="rounded-2xl overflow-hidden" style={{ border: '1px solid rgba(239,68,68,0.25)' }}>
@@ -380,17 +375,8 @@ function EntwertPanel({ chip, invoice, sats, requestedAt, onPayoutDone }: Entwer
           </p>
         </div>
 
-        {/* BUGFIX: Manueller Auszahl-Button statt Auto-Payout */}
-        {phase === 'pending' && (
-          <button
-            onClick={() => void doPayout()}
-            className="w-full h-11 rounded-xl flex items-center justify-center gap-2 text-sm font-bold transition-all hover:scale-[1.02] active:scale-[0.98]"
-            style={{ background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.3)', color: '#f87171' }}>
-            <Send className="w-4 h-4" /> Jetzt auszahlen ({sats.toLocaleString('de-DE')} sats)
-          </button>
-        )}
-
-        {phase === 'paying' && (
+        {/* Automatische Auszahlung */}
+        {(phase === 'pending' || phase === 'paying') && (
           <div className="w-full h-11 rounded-xl flex items-center justify-center gap-2"
             style={{ background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.15)' }}>
             <Loader2 className="w-4 h-4 animate-spin" style={{ color: '#f87171' }} />
@@ -726,10 +712,9 @@ export default function Index() {
   const { data: verifyLogs = [],         isLoading: logsLoading, refetch: refetchLogs }     = useVerifyLogs();
   const { data: reloadRequests = [],     refetch: refetchReloads }                           = useReloadRequests();
   const { data: invalidateRequests = [], refetch: refetchInvalidates }                       = useInvalidateRequests();
+  const { data: paymentEvents = [],      refetch: refetchPayments }                          = usePaymentEvents();
   const { mutateAsync: publishEvent }                                                        = usePublishAnonymous();
 
-  const [paidChips,     setPaidChips]     = useState<Record<string, string>>(() => loadPaidChips());
-  const [payoutDone,    setPayoutDone]    = useState<Set<string>>(() => loadPayoutDone());
   const [sessionReloads]                  = useState<Set<string>>(() => loadSessionReloads());
   const [tab,           setTab]           = useState<Tab>('overview');
   const [selectedUID,   setSelectedUID]   = useState<string | null>(() => getInitialUID());
@@ -750,47 +735,25 @@ export default function Index() {
   }, [chipUid]);
 
   // markPaid: LNbits hat die Einzahlung bestaetigt (Poll returned paid:true).
-  // Published Kind-3493 mit type:"reload" damit die App es sieht und
-  // den Chip auf "valid" setzen darf.
+  // Published Kind-3493 mit type:"reload" → permanent "valid" auf Nostr
+  // App sieht dieses Event und darf den Chip direkt auf valid setzen.
   const markPaid = useCallback((uid: string, at: string, hash: string) => {
-    savePaidChip(uid, at);
-    setPaidChips(prev => ({ ...prev, [uid]: at }));
-    // Wenn der Chip vorher ausgezahlt war und jetzt erneut bezahlt wird,
-    // entferne ihn aus payoutDone damit er wieder als "valid" angezeigt wird
-    const normUID = normalizeUID(uid);
-    setPayoutDone(prev => {
-      if (prev.has(normUID)) {
-        const next = new Set(prev);
-        next.delete(normUID);
-        localStorage.setItem(PAYOUT_DONE_KEY, JSON.stringify([...next]));
-        return next;
-      }
-      return prev;
-    });
-    // Kind-3493 mit type:"reload" publishen — App erkennt daran dass Einzahlung ok ist
     void publishEvent({
       kind: KIND_PAYMENT_CONFIRMED,
       content: JSON.stringify({ uid, paymentHash: hash, type: 'reload', paidAt: at }),
       tags: [['t', APP_TAG], ['alt', 'Bitcoin Note reload payment confirmed']],
-    });
-  }, [publishEvent]);
+    }).then(() => void refetchPayments());
+  }, [publishEvent, refetchPayments]);
 
-  const markUnloaded = useCallback((uid: string) => {
-    clearPaidChip(uid);
-    setPaidChips(prev => { const n = { ...prev }; delete n[uid]; return n; });
-  }, []);
-
-  const markPayoutDone = useCallback((uid: string) => {
-    savePayoutDone(uid);
-    clearPaidChip(uid);
-    const normUID = normalizeUID(uid);
-    setPayoutDone(prev => new Set([...prev, normUID]));
-    setPaidChips(prev => { const n = { ...prev }; delete n[uid]; return n; });
-  }, []);
+  // markPayoutDone: wird vom EntwertPanel aufgerufen nachdem LNbits bezahlt hat.
+  // Das Kind-3493 type:"payout" wurde bereits im EntwertPanel publiziert.
+  const markPayoutDone = useCallback(() => {
+    void refetchPayments();
+  }, [refetchPayments]);
 
   const handleRefresh = useCallback(() => {
-    void refetchLogs(); void refetchReloads(); void refetchInvalidates();
-  }, [refetchLogs, refetchReloads, refetchInvalidates]);
+    void refetchLogs(); void refetchReloads(); void refetchInvalidates(); void refetchPayments();
+  }, [refetchLogs, refetchReloads, refetchInvalidates, refetchPayments]);
 
   const handleAdminLogin = useCallback(() => {
     if (loginUser === ADMIN_USER && loginPass === ADMIN_PASS) {
@@ -810,40 +773,25 @@ export default function Index() {
     localStorage.removeItem(ADMIN_STORAGE_KEY);
   }, []);
 
-  // Admin: Reset chip status (entferne paidChips + payoutDone Eintraege)
-  const adminResetChip = useCallback((uid: string) => {
-    clearPaidChip(uid);
-    setPaidChips(prev => { const n = { ...prev }; delete n[uid]; return n; });
-    const normUID = normalizeUID(uid);
-    setPayoutDone(prev => {
-      const next = new Set(prev);
-      next.delete(normUID);
-      localStorage.setItem(PAYOUT_DONE_KEY, JSON.stringify([...next]));
-      return next;
-    });
-  }, []);
-
-  // Admin: Manuell als bezahlt markieren
+  // Admin: Manuell als bezahlt markieren (publisht Kind-3493 type:reload)
   const adminMarkPaid = useCallback((uid: string) => {
     const at = new Date().toLocaleString('de-DE') + ' (Admin)';
-    savePaidChip(uid, at);
-    setPaidChips(prev => ({ ...prev, [uid]: at }));
-    const normUID = normalizeUID(uid);
-    setPayoutDone(prev => {
-      if (prev.has(normUID)) {
-        const next = new Set(prev);
-        next.delete(normUID);
-        localStorage.setItem(PAYOUT_DONE_KEY, JSON.stringify([...next]));
-        return next;
-      }
-      return prev;
-    });
-  }, []);
+    void publishEvent({
+      kind: KIND_PAYMENT_CONFIRMED,
+      content: JSON.stringify({ uid, paymentHash: 'admin-manual', type: 'reload', paidAt: at }),
+      tags: [['t', APP_TAG], ['alt', 'Bitcoin Note reload (admin)']],
+    }).then(() => void refetchPayments());
+  }, [publishEvent, refetchPayments]);
 
-  // Admin: Manuell als ausgezahlt markieren
+  // Admin: Manuell als ausgezahlt markieren (publisht Kind-3493 type:payout)
   const adminMarkPayoutDone = useCallback((uid: string) => {
-    markPayoutDone(uid);
-  }, [markPayoutDone]);
+    const at = new Date().toLocaleString('de-DE') + ' (Admin)';
+    void publishEvent({
+      kind: KIND_PAYMENT_CONFIRMED,
+      content: JSON.stringify({ uid, paymentHash: 'admin-manual', type: 'payout', paidAt: at, sats: 0 }),
+      tags: [['t', APP_TAG], ['alt', 'Bitcoin Note payout (admin)']],
+    }).then(() => void refetchPayments());
+  }, [publishEvent, refetchPayments]);
 
   const selectedChip  = selectedUID ? CHIP_REGISTRY.find(c => c.uid === selectedUID) ?? null : null;
   const selectedIndex = selectedUID ? CHIP_REGISTRY.findIndex(c => c.uid === selectedUID) : -1;
@@ -907,30 +855,30 @@ export default function Index() {
       <main className="relative z-10 max-w-2xl mx-auto px-3 sm:px-4 py-5 space-y-5">
 
         {/* ── Chip Detail ── */}
-        {selectedUID && selectedChip && (
-          <ChipDetailPage
-            chip={selectedChip}
-            index={selectedIndex}
-            resolvedStatus={resolveChipStatus(
-              selectedChip,
-              payoutDone,
-              paidChips,
-              !!selectedInvalidateReq,
-            )}
-            paidAt={paidChips[selectedUID] ?? null}
-            hasReloadRequest={latestReloadRequest(reloadRequests, selectedUID) !== null || sessionReloads.has(selectedUID)}
-            requestedAt={latestReloadRequest(reloadRequests, selectedUID)?.timestamp ?? null}
-            sessionRequested={sessionReloads.has(selectedUID)}
-            onPaid={(at, hash) => markPaid(selectedUID, at, hash)}
-            onUnload={() => markUnloaded(selectedUID)}
-            onBack={() => { setSelectedUID(null); navigate('/'); }}
-            onPayoutDone={() => markPayoutDone(selectedUID)}
-            verifyLogs={verifyLogs}
-            invalidateRequest={selectedInvalidateReq
-              ? { invoice: selectedInvalidateReq.invoice, sats: selectedInvalidateReq.sats, requestedAt: selectedInvalidateReq.timestamp }
-              : null}
-          />
-        )}
+        {selectedUID && selectedChip && (() => {
+          const rStatus = resolveChipStatus(selectedChip, paymentEvents, invalidateRequests);
+          const reloaded = isChipReloaded(paymentEvents, selectedUID);
+          const reloadPmt = latestPaymentForChip(paymentEvents, selectedUID);
+          return (
+            <ChipDetailPage
+              chip={selectedChip}
+              index={selectedIndex}
+              resolvedStatus={rStatus}
+              paidAt={reloaded ? (reloadPmt?.paidAt ?? 'Ja') : null}
+              hasReloadRequest={latestReloadRequest(reloadRequests, selectedUID) !== null || sessionReloads.has(selectedUID)}
+              requestedAt={latestReloadRequest(reloadRequests, selectedUID)?.timestamp ?? null}
+              sessionRequested={sessionReloads.has(selectedUID)}
+              onPaid={(at, hash) => markPaid(selectedUID, at, hash)}
+              onUnload={() => {/* no-op: Status kommt aus Nostr */}}
+              onBack={() => { setSelectedUID(null); navigate('/'); }}
+              onPayoutDone={() => markPayoutDone()}
+              verifyLogs={verifyLogs}
+              invalidateRequest={selectedInvalidateReq && rStatus !== 'invalid'
+                ? { invoice: selectedInvalidateReq.invoice, sats: selectedInvalidateReq.sats, requestedAt: selectedInvalidateReq.timestamp }
+                : null}
+            />
+          );
+        })()}
 
         {/* ── Overview Tab ── */}
         {!selectedUID && tab === 'overview' && (
@@ -941,7 +889,7 @@ export default function Index() {
                 { label: 'Scheine', value: CHIP_REGISTRY.length, color: 'rgba(247,147,26,0.7)' },
                 {
                   label: 'Valid',
-                  value: CHIP_REGISTRY.filter(c => resolveChipStatus(c, payoutDone, paidChips, !!latestInvalidateRequest(invalidateRequests, c.uid)) === 'valid').length,
+                  value: CHIP_REGISTRY.filter(c => resolveChipStatus(c, paymentEvents, invalidateRequests) === 'valid').length,
                   color: '#34d399',
                 },
                 { label: 'Verif.', value: logsLoading ? '…' : verifyLogs.length, color: 'rgba(255,255,255,0.5)' },
@@ -968,8 +916,8 @@ export default function Index() {
             <div className="space-y-2">
               {CHIP_REGISTRY.map((chip, i) => {
                 const last   = verifyLogs.find(l => normalizeUID(l.uid) === normalizeUID(chip.uid));
-                const rStatus = resolveChipStatus(chip, payoutDone, paidChips, !!latestInvalidateRequest(invalidateRequests, chip.uid));
-                const hasInv = !!latestInvalidateRequest(invalidateRequests, chip.uid);
+                const rStatus = resolveChipStatus(chip, paymentEvents, invalidateRequests);
+                const hasInv = !!latestInvalidateRequest(invalidateRequests, chip.uid) && rStatus !== 'invalid';
 
                 return (
                   <button key={chip.uid} onClick={() => setSelectedUID(chip.uid)}
@@ -1043,37 +991,25 @@ export default function Index() {
                   <span className="text-xs font-bold" style={{ color: '#f87171' }}>Admin-Werkzeuge</span>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <button onClick={() => {
-                    CHIP_REGISTRY.forEach(c => adminResetChip(c.uid));
-                  }}
+                  <button onClick={() => CHIP_REGISTRY.forEach(c => adminMarkPaid(c.uid))}
                     className="text-[10px] px-3 py-1.5 rounded-xl font-bold flex items-center gap-1.5"
-                    style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', color: '#f87171' }}>
-                    <Trash2 className="w-3 h-3" /> Alle Chips zuruecksetzen
-                  </button>
-                  <button onClick={() => {
-                    localStorage.removeItem(PAID_STORAGE_KEY);
-                    localStorage.removeItem(PAYOUT_DONE_KEY);
-                    setPaidChips({});
-                    setPayoutDone(new Set());
-                  }}
-                    className="text-[10px] px-3 py-1.5 rounded-xl font-bold flex items-center gap-1.5"
-                    style={{ background: 'rgba(249,115,22,0.1)', border: '1px solid rgba(249,115,22,0.2)', color: '#fb923c' }}>
-                    <Trash2 className="w-3 h-3" /> localStorage leeren
+                    style={{ background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.2)', color: '#34d399' }}>
+                    <Check className="w-3 h-3" /> Alle auf "aufgeladen" setzen
                   </button>
                 </div>
               </div>
             )}
 
             {/* Pending Entwertungen */}
-            {invalidateRequests.filter(r => r.chipStatus === 'invalid').length > 0 && (
+            {invalidateRequests.filter(r => r.chipStatus === 'invalid' && !isChipPaidOut(paymentEvents, r.uid)).length > 0 && (
               <div className="space-y-2">
                 <h3 className="text-xs font-bold uppercase tracking-wider flex items-center gap-2"
                   style={{ color: '#f87171' }}>
                   <AlertTriangle className="w-3.5 h-3.5" />
-                  Offene Entwertungen ({invalidateRequests.filter(r => r.chipStatus === 'invalid' && !payoutDone.has(normalizeUID(r.uid))).length})
+                  Offene Entwertungen ({invalidateRequests.filter(r => r.chipStatus === 'invalid' && !isChipPaidOut(paymentEvents, r.uid)).length})
                 </h3>
                 {invalidateRequests
-                  .filter(r => r.chipStatus === 'invalid' && !payoutDone.has(normalizeUID(r.uid)))
+                  .filter(r => r.chipStatus === 'invalid' && !isChipPaidOut(paymentEvents, r.uid))
                   .slice(0, 5)
                   .map(req => {
                     const chip = CHIP_REGISTRY.find(c => normalizeUID(c.uid) === normalizeUID(req.uid));
@@ -1115,18 +1051,20 @@ export default function Index() {
             <div className="space-y-2">
               {CHIP_REGISTRY.map((chip, i) => {
                 const last       = verifyLogs.find(l => normalizeUID(l.uid) === normalizeUID(chip.uid));
-                const paidAt     = paidChips[chip.uid] ?? null;
+                const reloaded   = isChipReloaded(paymentEvents, chip.uid);
+                const reloadPmt  = latestPaymentForChip(paymentEvents, chip.uid);
+                const paidAt     = reloaded ? (reloadPmt?.paidAt ?? null) : null;
                 const reloadReq  = latestReloadRequest(reloadRequests, chip.uid);
                 const hasReload  = reloadReq !== null || sessionReloads.has(chip.uid);
                 const invReq     = latestInvalidateRequest(invalidateRequests, chip.uid);
-                const rStatus    = resolveChipStatus(chip, payoutDone, paidChips, !!invReq);
+                const rStatus    = resolveChipStatus(chip, paymentEvents, invalidateRequests);
 
                 return (
                   <div key={chip.uid} className="rounded-2xl p-3 space-y-2.5"
                     style={{
                       background: rStatus === 'invalid' ? 'rgba(239,68,68,0.03)' :
-                                  paidAt ? 'rgba(16,185,129,0.03)' : 'rgba(255,255,255,0.02)',
-                      border: `1px solid ${rStatus === 'invalid' ? 'rgba(239,68,68,0.12)' : paidAt ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.06)'}`,
+                                  reloaded ? 'rgba(16,185,129,0.03)' : 'rgba(255,255,255,0.02)',
+                      border: `1px solid ${rStatus === 'invalid' ? 'rgba(239,68,68,0.12)' : reloaded ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.06)'}`,
                     }}>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold flex-shrink-0"
@@ -1139,7 +1077,7 @@ export default function Index() {
                     </div>
                     <div className="font-mono text-[10px] break-all" style={{ color: 'rgba(255,255,255,0.25)' }}>{chip.uid}</div>
                     <div className="pt-1 border-t" style={{ borderColor: 'rgba(255,255,255,0.04)' }}>
-                      {invReq && !payoutDone.has(normalizeUID(chip.uid)) ? (
+                      {invReq && rStatus !== 'invalid' ? (
                         <button onClick={() => setSelectedUID(chip.uid)}
                           className="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1.5 rounded-xl font-bold"
                           style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', color: '#f87171' }}>
@@ -1150,7 +1088,7 @@ export default function Index() {
                           chip={chip} paidAt={paidAt}
                           hasReloadRequest={hasReload} requestedAt={reloadReq?.timestamp ?? null}
                           onPaid={(at, hash) => markPaid(chip.uid, at, hash)}
-                          onUnload={() => markUnloaded(chip.uid)}
+                          onUnload={() => {/* Status aus Nostr */}}
                           sessionRequested={sessionReloads.has(chip.uid)}
                           compact
                         />
@@ -1158,20 +1096,15 @@ export default function Index() {
                       {/* Admin actions */}
                       {isAdmin && (
                         <div className="flex items-center gap-2 mt-2 pt-2" style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
-                          <button onClick={() => adminResetChip(chip.uid)}
-                            className="text-[9px] px-2 py-0.5 rounded flex items-center gap-1"
-                            style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.15)', color: 'rgba(239,68,68,0.6)' }}>
-                            <Trash2 className="w-2.5 h-2.5" /> Reset
-                          </button>
                           <button onClick={() => adminMarkPaid(chip.uid)}
                             className="text-[9px] px-2 py-0.5 rounded flex items-center gap-1"
                             style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.15)', color: 'rgba(16,185,129,0.6)' }}>
-                            <Edit className="w-2.5 h-2.5" /> Bezahlt setzen
+                            <Edit className="w-2.5 h-2.5" /> Aufgeladen setzen
                           </button>
                           <button onClick={() => adminMarkPayoutDone(chip.uid)}
                             className="text-[9px] px-2 py-0.5 rounded flex items-center gap-1"
                             style={{ background: 'rgba(249,115,22,0.08)', border: '1px solid rgba(249,115,22,0.15)', color: 'rgba(249,115,22,0.6)' }}>
-                            <ShieldX className="w-2.5 h-2.5" /> Ausgezahlt setzen
+                            <ShieldX className="w-2.5 h-2.5" /> Entwertet setzen
                           </button>
                         </div>
                       )}
