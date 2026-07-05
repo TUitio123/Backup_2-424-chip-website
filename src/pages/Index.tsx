@@ -125,7 +125,12 @@ function resolveChipStatus(
   const latest = latestPaymentForChip(paymentEvents, chip.uid);
 
   if (latest) {
-    if (latest.type === 'reload') return 'valid';
+    if (latest.type === 'reload') {
+      // Aufgeladen — nur eine NEUERE Entwertungs-Anfrage darf das ueberschreiben
+      const invReq = latestInvalidateRequest(invalidateRequests, chip.uid);
+      if (invReq && invReq.timestamp > latest.timestamp) return 'entwertenbeantragt';
+      return 'valid';
+    }
     if (latest.type === 'payout') return 'invalid';
   }
 
