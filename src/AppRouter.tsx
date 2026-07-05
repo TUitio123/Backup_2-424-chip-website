@@ -11,8 +11,10 @@ export function AppRouter() {
       <ScrollToTop />
       <Routes>
         <Route path="/" element={<Index />} />
+        {/* Chip-Detail per UID im Pfad: /04C1685ABF1D90 */}
+        <Route path="/:chipUid" element={<Index />} />
         {/* NIP-19 route for npub1, note1, naddr1, nevent1, nprofile1 */}
-        <Route path="/:nip19" element={<NIP19Page />} />
+        <Route path="/nostr/:nip19" element={<NIP19Page />} />
         {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
         <Route path="*" element={<NotFound />} />
       </Routes>
