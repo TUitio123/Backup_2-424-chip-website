@@ -64,13 +64,21 @@ export function usePaymentEvents() {
 }
 
 /**
- * Für eine gegebene UID: Was ist die neueste Zahlungsbestaetigung?
- * Gibt 'reload' (aufgeladen), 'payout' (ausgezahlt), oder null (nie bestaetigt) zurueck.
+ * Neuestes reload UND neuestes payout Event fuer eine UID.
+ * Vergleicht beide Timestamps — das neuere gewinnt.
  */
 export function latestPaymentForChip(
   events: PaymentEvent[],
   uid: string,
 ): PaymentEvent | null {
   const norm = normalizeUID(uid);
-  return events.find(e => normalizeUID(e.uid) === norm) ?? null;
+  const matching = events.filter(e => normalizeUID(e.uid) === norm);
+  const latestReload = matching.find(e => e.type === 'reload') ?? null;
+  const latestPayout = matching.find(e => e.type === 'payout') ?? null;
+
+  if (latestReload && latestPayout) {
+    // Beide existieren → das neuere gewinnt
+    return latestReload.timestamp >= latestPayout.timestamp ? latestReload : latestPayout;
+  }
+  return latestReload ?? latestPayout;
 }
